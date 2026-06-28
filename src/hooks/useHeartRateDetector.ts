@@ -366,7 +366,6 @@ export function useHeartRateDetector() {
       setData(prev => ({ ...prev, status: 'error', errorMsg: msg }));
     }
   }, [processFrame]);
-
   const stop = useCallback(() => {
     isRunningRef.current = false;
     if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
@@ -378,7 +377,6 @@ export function useHeartRateDetector() {
     smoothBpmRef.current = 0;
     setData(prev => ({ ...prev, status: 'idle' }));
   }, []);
-
   useEffect(() => {
     return () => {
       isRunningRef.current = false;
