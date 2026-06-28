@@ -118,9 +118,10 @@ function App() {
         }
         return 'Analyzing signal — hold still...';
       case 'measuring':
+        if (data.confidence <= 10) return 'Holding last reading — recalibrating...';
         if (data.confidence < 40) return 'Stabilizing — keep your finger still...';
         if (data.confidence < 65) return 'Measuring — signal improving...';
-        return `Reading your heartbeat ♥ (${cam} cam)`;
+        return `Continuously monitoring ♥ (${cam} cam)`;
       case 'error': return data.errorMsg;
       default: return '';
     }
@@ -290,20 +291,29 @@ function App() {
                 transition: 'transform 0.1s ease-out',
                 filter: data.bpm > 0 ? `drop-shadow(0 0 ${heartScale > 1.1 ? 15 : 5}px rgba(239,68,68,0.5))` : 'none',
               }}>
-                {data.fingerDetected && isActive ? '❤️' : '🤍'}
+                {data.fingerDetected && isActive ? '❤️' : data.bpm > 0 && isActive ? '❤️' : '🤍'}
               </div>
 
-              {/* BPM number */}
+              {/* BPM number — stays visible once established */}
               <div className="font-mono font-bold leading-none mt-1" style={{
                 fontSize: data.bpm > 0 ? 'clamp(4rem, 15vw, 7rem)' : '4rem',
                 transform: `scale(${heartScale > 1.1 ? 1.02 : 1})`,
                 transition: 'transform 0.1s ease-out',
               }}>
-                <span className={data.bpm > 0 ? 'text-red-500' : 'text-gray-700'}>
+                <span className={
+                  data.bpm > 0
+                    ? data.confidence > 30 ? 'text-red-500' : 'text-red-500/60'
+                    : 'text-gray-700'
+                }>
                   {data.bpm > 0 ? data.bpm : '—'}
                 </span>
               </div>
-              <div className="text-gray-500 font-mono text-sm mt-0.5">BPM</div>
+              <div className="text-gray-500 font-mono text-sm mt-0.5">
+                {data.bpm > 0 && data.confidence <= 20 && isActive
+                  ? <span className="text-yellow-500/70">Last reading • Recalibrating...</span>
+                  : 'BPM'
+                }
+              </div>
 
               {/* Zone */}
               {data.bpm > 0 && (
