@@ -42,9 +42,9 @@ export function useHeartRateDetector() {
   const lastPeakTimeRef = useRef(0);
 
   const smoothBpmRef = useRef(0);
-  const lastGoodBpmRef = useRef(0);        // persist last good reading
+  const lastGoodBpmRef = useRef(0);
   const lastGoodConfRef = useRef(0);
-  const bpmStaleCountRef = useRef(0);       // frames since last good calc
+  const bpmStaleCountRef = useRef(0);
   const frameCountRef = useRef(0);
   const lastUIUpdateRef = useRef(0);
 
@@ -67,58 +67,90 @@ export function useHeartRateDetector() {
     return result;
   };
 
+  // Bandpass filter via dual moving averages:
+  // - Heavy smooth (window 13) kills high-frequency noise (camera jitter, lighting flicker)
+  // - Long baseline (window 75) removes slow drift (finger pressure changes, auto-exposure)
+  // Result: only the heartbeat oscillation (~0.8–2.5 Hz) passes through
   const bandpassFilter = (arr: number[]): number[] => {
-    if (arr.length < 20) return arr;
-    const smoothed = movingAvg(arr, 9);
-    const baseline = movingAvg(smoothed, 61);
+    if (arr.length < 30) return arr;
+    const smoothed = movingAvg(arr, 13);      // kill noise above ~2.3 Hz at 30fps
+    const baseline = movingAvg(smoothed, 75);  // remove drift below ~0.4 Hz
     return smoothed.map((v, i) => v - baseline[i]);
   };
 
+  // Reject sudden camera auto-exposure spikes
   const rejectSpike = (buffer: number[], newVal: number): number => {
-    if (buffer.length < 5) return newVal;
-    const recent = buffer.slice(-10);
+    if (buffer.length < 8) return newVal;
+    const recent = buffer.slice(-15);
     const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
     const std = Math.sqrt(recent.reduce((s, v) => s + (v - mean) ** 2, 0) / recent.length);
-    if (std > 0 && Math.abs(newVal - mean) > 3 * std) return mean;
+    if (std > 0.5 && Math.abs(newVal - mean) > 2.5 * std) return mean;
     return newVal;
   };
 
+  // Robust peak detection — the most critical function for accuracy
   const findPeaks = (signal: number[]): number[] => {
-    if (signal.length < 30) return [];
-    const values = signal.slice(-200);
-    const mean = values.reduce((a, b) => a + b, 0) / values.length;
-    const std = Math.sqrt(values.reduce((s, v) => s + (v - mean) ** 2, 0) / values.length);
-    const threshold = mean + std * 0.4;
-    const minDistance = 9;
+    if (signal.length < 40) return [];
+
+    // Statistics over recent signal
+    const recent = signal.slice(-250);
+    const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
+    const std = Math.sqrt(recent.reduce((s, v) => s + (v - mean) ** 2, 0) / recent.length);
+
+    // Peak must be significantly above mean — higher threshold = fewer false positives
+    // 0.6 * std means only the top ~27% of the signal qualifies
+    const threshold = mean + std * 0.6;
+
+    // Minimum distance between peaks:
+    // At 30fps, 15 frames = 500ms = max 120 BPM
+    // This prevents detecting noise between real beats
+    // Real resting HR is 50-100 BPM = 600-1200ms = 18-36 frames
+    const minDistance = 15;
+
     const peaks: number[] = [];
 
-    for (let i = 2; i < signal.length - 2; i++) {
+    for (let i = 3; i < signal.length - 3; i++) {
       const v = signal[i];
+
+      // Must be above threshold
       if (v <= threshold) continue;
-      if (v < signal[i - 1] || v < signal[i + 1]) continue;
-      if (v < signal[i - 2] || v < signal[i + 2]) continue;
-      if (peaks.length > 0 && i - peaks[peaks.length - 1] < minDistance) {
-        if (v > signal[peaks[peaks.length - 1]]) peaks[peaks.length - 1] = i;
-        continue;
+
+      // Must be a local maximum — check 3 neighbors on each side
+      // This is stricter than checking 2, rejects more noise
+      let isMax = true;
+      for (let d = 1; d <= 3; d++) {
+        if (v < signal[i - d] || v < signal[i + d]) { isMax = false; break; }
       }
+      if (!isMax) continue;
+
+      // Must be far enough from last accepted peak
+      if (peaks.length > 0) {
+        const lastPeak = peaks[peaks.length - 1];
+        const dist = i - lastPeak;
+        if (dist < minDistance) {
+          // Within minimum distance — only keep the taller one
+          if (v > signal[lastPeak]) {
+            peaks[peaks.length - 1] = i;
+          }
+          continue;
+        }
+      }
+
       peaks.push(i);
     }
+
     return peaks;
   };
 
+  // Calculate BPM from beat timestamps
   const calculateBPM = (beatTimes: number[]): { bpm: number; confidence: number } => {
     const now = Date.now();
-
-    // Use wider window: keep beats from last 20 seconds (was 12)
     const recent = beatTimes.filter(t => now - t < 20000);
 
-    // Need at least 3 beats (was 4 — too strict, caused drops)
     if (recent.length < 3) {
-      // Instead of returning 0, return last known good BPM with decaying confidence
       if (lastGoodBpmRef.current > 0) {
         bpmStaleCountRef.current++;
-        // Confidence drops as stale time increases, but BPM stays visible
-        const decayedConf = Math.max(5, lastGoodConfRef.current - bpmStaleCountRef.current * 3);
+        const decayedConf = Math.max(5, lastGoodConfRef.current - bpmStaleCountRef.current * 2);
         return { bpm: lastGoodBpmRef.current, confidence: decayedConf };
       }
       return { bpm: 0, confidence: 0 };
@@ -127,17 +159,22 @@ export function useHeartRateDetector() {
     const intervals: number[] = [];
     for (let i = 1; i < recent.length; i++) intervals.push(recent[i] - recent[i - 1]);
 
+    // IQR outlier removal
     const sorted = [...intervals].sort((a, b) => a - b);
     const q1 = sorted[Math.floor(sorted.length * 0.25)];
     const q3 = sorted[Math.floor(sorted.length * 0.75)];
     const iqr = q3 - q1;
-    const clean = intervals.filter(i => i >= Math.max(280, q1 - 1.5 * iqr) && i <= Math.min(1600, q3 + 1.5 * iqr));
+
+    // Clamp: min 400ms (150 BPM max), max 1500ms (40 BPM min)
+    const clean = intervals.filter(i =>
+      i >= Math.max(400, q1 - 1.5 * iqr) &&
+      i <= Math.min(1500, q3 + 1.5 * iqr)
+    );
 
     if (clean.length < 2) {
-      // Not enough clean intervals — use last known BPM
       if (lastGoodBpmRef.current > 0) {
         bpmStaleCountRef.current++;
-        const decayedConf = Math.max(5, lastGoodConfRef.current - bpmStaleCountRef.current * 3);
+        const decayedConf = Math.max(5, lastGoodConfRef.current - bpmStaleCountRef.current * 2);
         return { bpm: lastGoodBpmRef.current, confidence: decayedConf };
       }
       return { bpm: 0, confidence: 0 };
@@ -145,28 +182,42 @@ export function useHeartRateDetector() {
 
     const avg = clean.reduce((a, b) => a + b, 0) / clean.length;
     const rawBpm = 60000 / avg;
-    if (rawBpm < 40 || rawBpm > 200) {
+
+    // Hard cap: resting human HR is realistically 45-160
+    if (rawBpm < 45 || rawBpm > 160) {
       if (lastGoodBpmRef.current > 0) {
         bpmStaleCountRef.current++;
-        const decayedConf = Math.max(5, lastGoodConfRef.current - bpmStaleCountRef.current * 3);
+        const decayedConf = Math.max(5, lastGoodConfRef.current - bpmStaleCountRef.current * 2);
         return { bpm: lastGoodBpmRef.current, confidence: decayedConf };
       }
       return { bpm: 0, confidence: 0 };
     }
 
-    // Smooth BPM
-    if (smoothBpmRef.current === 0) smoothBpmRef.current = rawBpm;
-    else smoothBpmRef.current = smoothBpmRef.current * 0.8 + rawBpm * 0.2;
+    // Smooth BPM — slower alpha (0.12) for more stability
+    if (smoothBpmRef.current === 0) {
+      smoothBpmRef.current = rawBpm;
+    } else {
+      // Only accept values within ±25% of current smooth — reject wild jumps
+      const diff = Math.abs(rawBpm - smoothBpmRef.current) / smoothBpmRef.current;
+      if (diff > 0.25) {
+        // Too big a jump — blend very slowly (5%) or reject
+        smoothBpmRef.current = smoothBpmRef.current * 0.95 + rawBpm * 0.05;
+      } else {
+        smoothBpmRef.current = smoothBpmRef.current * 0.88 + rawBpm * 0.12;
+      }
+    }
 
     const bpm = Math.round(smoothBpmRef.current);
     const variance = clean.reduce((sum, i) => sum + (i - avg) ** 2, 0) / clean.length;
     const cv = Math.sqrt(variance) / avg;
     const confidence = Math.max(0, Math.min(100, Math.round((1 - cv * 3) * 100)));
 
-    // Save as last known good reading
-    lastGoodBpmRef.current = bpm;
-    lastGoodConfRef.current = confidence;
-    bpmStaleCountRef.current = 0;
+    // Only save as "good" if confidence is decent
+    if (confidence > 25) {
+      lastGoodBpmRef.current = bpm;
+      lastGoodConfRef.current = confidence;
+      bpmStaleCountRef.current = 0;
+    }
 
     return { bpm, confidence };
   };
@@ -252,7 +303,8 @@ export function useHeartRateDetector() {
 
       const bufLen = rawRedRef.current.length;
 
-      if (bufLen > 90) {
+      // Need ~4 seconds of data (120 frames) for reliable first reading
+      if (bufLen > 120) {
         const filtered = bandpassFilter(rawRedRef.current);
         const peaks = findPeaks(filtered);
 
@@ -261,10 +313,13 @@ export function useHeartRateDetector() {
           const peakTime = timestampsRef.current[peakIdx];
           if (!peakTime) continue;
           if (peakTime <= lastPeakTimeRef.current) continue;
+
+          // Inter-beat interval must be 400ms–1500ms (40–150 BPM)
           if (beatTimesRef.current.length > 0) {
             const interval = peakTime - beatTimesRef.current[beatTimesRef.current.length - 1];
-            if (interval < 300 || interval > 2000) continue;
+            if (interval < 400 || interval > 1500) continue;
           }
+
           beatTimesRef.current.push(peakTime);
           lastPeakTimeRef.current = peakTime;
           newBeatTime = peakTime;
@@ -295,7 +350,6 @@ export function useHeartRateDetector() {
           setData(prev => ({ ...prev, lastBeatTime: newBeatTime }));
         }
       } else {
-        // Collecting initial data — but if we have a previous BPM, keep showing it
         if (now - lastUIUpdateRef.current > 100) {
           lastUIUpdateRef.current = now;
           setData(prev => ({
@@ -310,14 +364,12 @@ export function useHeartRateDetector() {
         }
       }
     } else {
-      // Finger removed — KEEP the last known BPM, just update finger status
       if (now - lastUIUpdateRef.current > 200) {
         lastUIUpdateRef.current = now;
         setData(prev => ({
           ...prev,
           avgRedLevel: avgRed,
           fingerDetected: false,
-          // Keep BPM showing — don't reset to 0
           bpm: lastGoodBpmRef.current > 0 ? lastGoodBpmRef.current : prev.bpm,
           rawSignal: rawDisplayRef.current.slice(-400),
           cameraMode: cameraModeRef.current,
@@ -336,7 +388,6 @@ export function useHeartRateDetector() {
       setData(prev => ({ ...prev, status: 'starting', errorMsg: '', cameraMode: mode }));
 
       const facingMode = mode === 'front' ? 'user' : 'environment';
-
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: { ideal: facingMode },
@@ -361,9 +412,7 @@ export function useHeartRateDetector() {
         } catch {
           try {
             await track.applyConstraints({ advanced: [{ torch: true } as any] });
-          } catch {
-            console.log('Torch not available');
-          }
+          } catch { /* torch unavailable */ }
         }
       }
 
@@ -373,7 +422,6 @@ export function useHeartRateDetector() {
         await videoRef.current.play();
       }
 
-      // Reset buffers but NOT the last known BPM
       rawRedRef.current = [];
       rawDisplayRef.current = [];
       timestampsRef.current = [];
@@ -388,7 +436,6 @@ export function useHeartRateDetector() {
 
       isRunningRef.current = true;
       animFrameRef.current = requestAnimationFrame(processFrame);
-
       setData(prev => ({ ...prev, status: 'detecting', cameraMode: mode }));
     } catch (err: any) {
       let msg = 'Could not access camera.';
@@ -407,7 +454,6 @@ export function useHeartRateDetector() {
       streamRef.current = null;
     }
     if (videoRef.current) videoRef.current.srcObject = null;
-    // Don't reset smoothBpmRef — keep it for display
     setData(prev => ({ ...prev, status: 'idle' }));
   }, []);
 
