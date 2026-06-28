@@ -34,17 +34,17 @@ export function useHeartRateDetector() {
   const isRunningRef = useRef(false);
   const cameraModeRef = useRef<CameraMode>('rear');
 
-  // Signal buffers
   const rawRedRef = useRef<number[]>([]);
   const timestampsRef = useRef<number[]>([]);
   const rawDisplayRef = useRef<number[]>([]);
 
-  // Beat tracking
   const beatTimesRef = useRef<number[]>([]);
   const lastPeakTimeRef = useRef(0);
 
-  // BPM smoothing
   const smoothBpmRef = useRef(0);
+  const lastGoodBpmRef = useRef(0);        // persist last good reading
+  const lastGoodConfRef = useRef(0);
+  const bpmStaleCountRef = useRef(0);       // frames since last good calc
   const frameCountRef = useRef(0);
   const lastUIUpdateRef = useRef(0);
 
@@ -107,10 +107,22 @@ export function useHeartRateDetector() {
   };
 
   const calculateBPM = (beatTimes: number[]): { bpm: number; confidence: number } => {
-    if (beatTimes.length < 4) return { bpm: 0, confidence: 0 };
     const now = Date.now();
-    const recent = beatTimes.filter(t => now - t < 12000);
-    if (recent.length < 4) return { bpm: 0, confidence: 0 };
+
+    // Use wider window: keep beats from last 20 seconds (was 12)
+    const recent = beatTimes.filter(t => now - t < 20000);
+
+    // Need at least 3 beats (was 4 — too strict, caused drops)
+    if (recent.length < 3) {
+      // Instead of returning 0, return last known good BPM with decaying confidence
+      if (lastGoodBpmRef.current > 0) {
+        bpmStaleCountRef.current++;
+        // Confidence drops as stale time increases, but BPM stays visible
+        const decayedConf = Math.max(5, lastGoodConfRef.current - bpmStaleCountRef.current * 3);
+        return { bpm: lastGoodBpmRef.current, confidence: decayedConf };
+      }
+      return { bpm: 0, confidence: 0 };
+    }
 
     const intervals: number[] = [];
     for (let i = 1; i < recent.length; i++) intervals.push(recent[i] - recent[i - 1]);
@@ -119,13 +131,30 @@ export function useHeartRateDetector() {
     const q1 = sorted[Math.floor(sorted.length * 0.25)];
     const q3 = sorted[Math.floor(sorted.length * 0.75)];
     const iqr = q3 - q1;
-    const clean = intervals.filter(i => i >= Math.max(300, q1 - 1.5 * iqr) && i <= Math.min(1500, q3 + 1.5 * iqr));
-    if (clean.length < 2) return { bpm: 0, confidence: 0 };
+    const clean = intervals.filter(i => i >= Math.max(280, q1 - 1.5 * iqr) && i <= Math.min(1600, q3 + 1.5 * iqr));
+
+    if (clean.length < 2) {
+      // Not enough clean intervals — use last known BPM
+      if (lastGoodBpmRef.current > 0) {
+        bpmStaleCountRef.current++;
+        const decayedConf = Math.max(5, lastGoodConfRef.current - bpmStaleCountRef.current * 3);
+        return { bpm: lastGoodBpmRef.current, confidence: decayedConf };
+      }
+      return { bpm: 0, confidence: 0 };
+    }
 
     const avg = clean.reduce((a, b) => a + b, 0) / clean.length;
     const rawBpm = 60000 / avg;
-    if (rawBpm < 40 || rawBpm > 200) return { bpm: 0, confidence: 0 };
+    if (rawBpm < 40 || rawBpm > 200) {
+      if (lastGoodBpmRef.current > 0) {
+        bpmStaleCountRef.current++;
+        const decayedConf = Math.max(5, lastGoodConfRef.current - bpmStaleCountRef.current * 3);
+        return { bpm: lastGoodBpmRef.current, confidence: decayedConf };
+      }
+      return { bpm: 0, confidence: 0 };
+    }
 
+    // Smooth BPM
     if (smoothBpmRef.current === 0) smoothBpmRef.current = rawBpm;
     else smoothBpmRef.current = smoothBpmRef.current * 0.8 + rawBpm * 0.2;
 
@@ -133,21 +162,20 @@ export function useHeartRateDetector() {
     const variance = clean.reduce((sum, i) => sum + (i - avg) ** 2, 0) / clean.length;
     const cv = Math.sqrt(variance) / avg;
     const confidence = Math.max(0, Math.min(100, Math.round((1 - cv * 3) * 100)));
+
+    // Save as last known good reading
+    lastGoodBpmRef.current = bpm;
+    lastGoodConfRef.current = confidence;
+    bpmStaleCountRef.current = 0;
+
     return { bpm, confidence };
   };
 
   // ===== FINGER DETECTION =====
-  // Rear camera + flash: strong red, very dominant
-  // Front camera + screen flash: weaker signal, less red-dominant, but still detectable
   const detectFinger = (avgRed: number, avgGreen: number, avgBlue: number): boolean => {
     if (cameraModeRef.current === 'rear') {
-      // Rear: finger + torch = very red and bright
       return avgRed > 80 && avgRed > avgGreen * 1.3 && avgRed > avgBlue * 1.3;
     } else {
-      // Front: screen light through finger is dimmer, less contrast
-      // The image is still reddish/warm but lower intensity
-      // Also accept if overall brightness is low (finger blocking most light)
-      // and the red channel is still dominant
       const brightness = (avgRed + avgGreen + avgBlue) / 3;
       const redRatio = avgRed / (brightness || 1);
       return (
@@ -201,11 +229,8 @@ export function useHeartRateDetector() {
     const fingerDetected = detectFinger(avgRed, avgGreen, avgBlue);
     frameCountRef.current++;
 
-    // For front camera, use green channel (better SNR through skin with white light)
-    // For rear camera, red channel is best (flash is red-dominant through tissue)
     let signalValue: number;
     if (cameraModeRef.current === 'front') {
-      // Green channel often has better pulse signal with white screen light
       signalValue = rejectSpike(rawRedRef.current, (avgRed + avgGreen) / 2);
     } else {
       signalValue = rejectSpike(rawRedRef.current, avgRed);
@@ -243,7 +268,7 @@ export function useHeartRateDetector() {
           beatTimesRef.current.push(peakTime);
           lastPeakTimeRef.current = peakTime;
           newBeatTime = peakTime;
-          if (beatTimesRef.current.length > 40) beatTimesRef.current.shift();
+          if (beatTimesRef.current.length > 60) beatTimesRef.current.shift();
         }
 
         const { bpm, confidence } = calculateBPM(beatTimesRef.current);
@@ -270,25 +295,30 @@ export function useHeartRateDetector() {
           setData(prev => ({ ...prev, lastBeatTime: newBeatTime }));
         }
       } else {
+        // Collecting initial data — but if we have a previous BPM, keep showing it
         if (now - lastUIUpdateRef.current > 100) {
           lastUIUpdateRef.current = now;
           setData(prev => ({
             ...prev,
+            bpm: lastGoodBpmRef.current > 0 ? lastGoodBpmRef.current : prev.bpm,
             avgRedLevel: avgRed,
             fingerDetected: true,
-            status: 'detecting',
+            status: lastGoodBpmRef.current > 0 ? 'measuring' : 'detecting',
             rawSignal: rawDisplayRef.current.slice(-400),
             cameraMode: cameraModeRef.current,
           }));
         }
       }
     } else {
+      // Finger removed — KEEP the last known BPM, just update finger status
       if (now - lastUIUpdateRef.current > 200) {
         lastUIUpdateRef.current = now;
         setData(prev => ({
           ...prev,
           avgRedLevel: avgRed,
           fingerDetected: false,
+          // Keep BPM showing — don't reset to 0
+          bpm: lastGoodBpmRef.current > 0 ? lastGoodBpmRef.current : prev.bpm,
           rawSignal: rawDisplayRef.current.slice(-400),
           cameraMode: cameraModeRef.current,
         }));
@@ -318,7 +348,6 @@ export function useHeartRateDetector() {
 
       streamRef.current = stream;
 
-      // Only try torch on rear camera
       if (mode === 'rear') {
         const track = stream.getVideoTracks()[0];
         try {
@@ -344,7 +373,7 @@ export function useHeartRateDetector() {
         await videoRef.current.play();
       }
 
-      // Reset everything
+      // Reset buffers but NOT the last known BPM
       rawRedRef.current = [];
       rawDisplayRef.current = [];
       timestampsRef.current = [];
@@ -353,6 +382,9 @@ export function useHeartRateDetector() {
       lastPeakTimeRef.current = 0;
       smoothBpmRef.current = 0;
       lastUIUpdateRef.current = 0;
+      lastGoodBpmRef.current = 0;
+      lastGoodConfRef.current = 0;
+      bpmStaleCountRef.current = 0;
 
       isRunningRef.current = true;
       animFrameRef.current = requestAnimationFrame(processFrame);
@@ -366,6 +398,7 @@ export function useHeartRateDetector() {
       setData(prev => ({ ...prev, status: 'error', errorMsg: msg }));
     }
   }, [processFrame]);
+
   const stop = useCallback(() => {
     isRunningRef.current = false;
     if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
@@ -374,9 +407,10 @@ export function useHeartRateDetector() {
       streamRef.current = null;
     }
     if (videoRef.current) videoRef.current.srcObject = null;
-    smoothBpmRef.current = 0;
+    // Don't reset smoothBpmRef — keep it for display
     setData(prev => ({ ...prev, status: 'idle' }));
   }, []);
+
   useEffect(() => {
     return () => {
       isRunningRef.current = false;
